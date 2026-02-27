@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Hand Game Online - Seek Mode Pro</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body { 
+            margin: 0; 
+            background: #000; 
+            overflow: hidden; 
+            font-family: sans-serif; 
+            touch-action: none;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+        }
+        #container { 
+            position: relative; 
+            width: 100%; 
+            height: 100%; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+        }
+        video { 
+            display: none; 
+        }
+        canvas { 
+            position: absolute; 
+            object-fit: contain; 
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); 
+        }
+        #ui-layer { 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            pointer-events: none; 
+            z-index: 10;
+        }
+        
+        /* ★ スコアとタイマーのサイズを1.5倍(clamp(36px, 9vw, 48px))に拡大 */
+        .overlay-text { 
+            position: absolute; 
+            color: #0f0; 
+            font-size: clamp(36px, 9vw, 48px); 
+            text-shadow: 2px 2px 4px #000; 
+            font-weight: bold; 
+            padding: 10px;
+        }
+        
+        #score-board { top: env(safe-area-inset-top, 20px); left: 10px; }
+        #timer-board { top: env(safe-area-inset-top, 20px); right: 10px; color: #fff; }
+        
+        #msg-center { 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%); 
+            font-size: 32px; 
+            text-align: center; 
+            color: #0f0; 
+            width: 90%;
+        }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="ui-layer">
+        <div id="score-board" class="overlay-text">Score: 0</div>
+        <div id="timer-board" class="overlay-text">Time: 60</div>
+        <div id="msg-center" class="overlay-text">
+            カメラ起動中...
+        </div>
+    </div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const scoreElement = document.getElementById('score-board');
+    const timerElement = document.getElementById('timer-board');
+    const msgElement = document.getElementById('msg-center');
+
+    let score = 0;
+    let count = 1;
+    let gameStarted = false;
+    let isCoolingDown = false; 
+    let remainingTime = 60;
+    let startTime = 0;
+    let cameraActive = false;
+
+    let circleRadius = 0;
+    let fingerRadius = 0;
+    let fontSize = 0;
+    let circles = [];
+    let audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    function updateUnitSizes() {
+        const unit = Math.min(canvasElement.width, canvasElement.height);
+        circleRadius = unit * 0.1;       
+        fingerRadius = unit * 0.07; 
+        fontSize = unit * 0.12;
+    }
+
+    function speak(text) {
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        window.speechSynthesis.speak(uttr);
+    }
+
+    function playBeep() {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.frequency.value = 900;
+        gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + 0.1);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+    }
+
+    function initCircles() {
+        circles = [];
+        let nums = Array.from({length: 10}, (_, i) => i + 1).sort(() => Math.random() - 0.5);
+        let sides = Array.from({length: 10}, () => Math.random() < 0.5 ? 'Left' : 'Right');
+
+        const cols = 2;
+        const rows = 5;
+
+        const centerX = canvasElement.width / 2;
+        const colSpacing = canvasElement.width * 0.38; 
+
+        // ★ 修正: 1段目の間隔を詰める (marginTopを0.22から0.15に変更)
+        const marginTop = canvasElement.height * 0.15; 
+        const marginBottom = canvasElement.height * 0.12; 
+        const rowSpacing = (canvasElement.height - marginTop - marginBottom) / (rows - 1);
+
+        let idx = 0;
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const x = centerX + (c === 0 ? -colSpacing / 2 : colSpacing / 2);
+                const y = marginTop + (r * rowSpacing);
+
+                circles.push({
+                    x: x, 
+                    y: y, 
+                    num: nums[idx], 
+                    handType: sides[idx], 
+                    cleared: false
+                });
+                idx++;
+            }
+        }
+    }
+
+    function onResults(results) {
+        if (!cameraActive) {
+            cameraActive = true;
+            msgElement.innerHTML = "手を高く挙げてスタート<br><span style='font-size: 28px; color: #ff0;'>青:左手　　　赤:右手</span>";
+        }
+
+        if (canvasElement.width !== results.image.width || canvasElement.height !== results.image.height) {
+            canvasElement.width = results.image.width;
+            canvasElement.height = results.image.height;
+            updateUnitSizes();
+        }
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiHandLandmarks && results.multiHandedness) {
+            for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                const landmarks = results.multiHandLandmarks[i];
+                const handLabel = results.multiHandedness[i].label; 
+                const x = landmarks[8].x * canvasElement.width;
+                const y = landmarks[8].y * canvasElement.height;
+
+                // ゲーム開始判定も少し位置を調整
+                if (!gameStarted && !isCoolingDown && landmarks[8].y < 0.15) {
+                    startGame();
+                }
+
+                canvasCtx.beginPath();
+                canvasCtx.arc(x, y, fingerRadius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = (handLabel === 'Left') ? 'rgba(255, 0, 0, 0.7)' : 'rgba(0, 0, 255, 0.7)';
+                canvasCtx.fill();
+                canvasCtx.strokeStyle = 'white';
+                canvasCtx.lineWidth = 3;
+                canvasCtx.stroke();
+
+                if (gameStarted) checkHit(x, y, handLabel);
+            }
+        }
+
+        if (gameStarted) {
+            updateGame();
+            drawCircles();
+        }
+        canvasCtx.restore();
+    }
+
+    function startGame() {
+        if (gameStarted) return;
+        gameStarted = true;
+        score = 0;
+        count = 1;
+        remainingTime = 60;
+        startTime = Date.now();
+        msgElement.innerHTML = "";
+        speak("スタート");
+        initCircles();
+    }
+
+    function updateGame() {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        remainingTime = Math.max(0, 60 - elapsed);
+        timerElement.innerText = `Time: ${remainingTime}`;
+        scoreElement.innerText = `Score: ${score}`;
+        if (remainingTime <= 0) endGame();
+    }
+
+    function endGame() {
+        gameStarted = false;
+        isCoolingDown = true;
+        circles = []; 
+        speak(`${score}点です。終了`);
+        let cooldownSec = 3;
+        const updateCooldownMsg = () => {
+            if (cooldownSec > 0) {
+                msgElement.innerHTML = `終了！ Score: ${score}<br><span style="font-size:26px; color: #ff9;">Wait ${cooldownSec}s...</span>`;
+                cooldownSec--;
+                setTimeout(updateCooldownMsg, 1000);
+            } else {
+                isCoolingDown = false;
+                msgElement.innerHTML = `終了！ Score: ${score}<br><span style="font-size:26px; color: #0f0;">手を挙げて再挑戦</span>`;
+            }
+        };
+        updateCooldownMsg();
+    }
+
+    function checkHit(hx, hy, handLabel) {
+        circles.forEach(c => {
+            if (!c.cleared && c.num === count && c.handType === handLabel) {
+                const dist = Math.sqrt((hx - c.x) ** 2 + (hy - c.y) ** 2);
+                if (dist < (circleRadius + fingerRadius * 0.6)) {
+                    c.cleared = true;
+                    score++;
+                    count++;
+                    playBeep();
+                    if (count > 10) { 
+                        initCircles(); 
+                        count = 1; 
+                    }
+                }
+            }
+        });
+    }
+
+    function drawCircles() {
+        circles.forEach(c => {
+            if (c.cleared) return;
+            
+            canvasCtx.beginPath();
+            canvasCtx.arc(c.x, c.y, circleRadius, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = (c.handType === 'Left') ? 'red' : 'blue';
+            canvasCtx.globalAlpha = 1.0; 
+            canvasCtx.fill();
+            
+            canvasCtx.strokeStyle = "#fff";
+            canvasCtx.lineWidth = 3;
+            canvasCtx.stroke();
+
+            canvasCtx.save();
+            canvasCtx.translate(c.x, c.y);
+            canvasCtx.scale(-1, 1); 
+            canvasCtx.fillStyle = "#fff";
+            canvasCtx.font = `bold ${fontSize}px Arial`;
+            canvasCtx.textAlign = "center";
+            canvasCtx.textBaseline = "middle";
+            canvasCtx.fillText(c.num, 0, 2); 
+            canvasCtx.restore();
+        });
+    }
+
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({ 
+        maxNumHands: 2, 
+        modelComplexity: 1, 
+        minDetectionConfidence: 0.6, 
+        minTrackingConfidence: 0.6 
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 1280, height: 720
+    });
+    camera.start();
+
+</script>
+</body>
+</html>
